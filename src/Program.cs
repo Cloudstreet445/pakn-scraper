@@ -3,6 +3,7 @@ using System.Diagnostics;
 using Microsoft.Playwright;
 using Microsoft.Extensions.Configuration;
 using static Scraper.CosmosDB;
+using static Scraper.MongoDBHandler;
 using static Scraper.Utilities;
 using System.Text.RegularExpressions;
 using PlaywrightExtraSharp;
@@ -22,6 +23,9 @@ namespace Scraper
         static bool uploadToDatabase = false;
         static bool uploadImages = false;
         static bool useHeadlessBrowser = true;
+        static bool useMongoDB = false;
+        static int totalNew = 0, totalPriceUpdated = 0, totalNonPriceUpdated = 0, totalUpToDate = 0;
+        static Stopwatch globalStopwatch = new Stopwatch(); 
 
         // Singletons for Playwright
         public static IPlaywright? playwright;
@@ -43,11 +47,25 @@ namespace Scraper
             {
                 if (arg.Contains("db"))
                 {
-                    // dotnet run db = will scrape and upload data to a database
                     uploadToDatabase = true;
 
-                    // Connect to CosmosDB
-                    await CosmosDB.EstablishConnection();
+                    // Use MongoDB if MONGO_URI is configured, otherwise fall back to CosmosDB
+                    string? mongoUri = config["MONGO_URI"];
+                    if (!string.IsNullOrWhiteSpace(mongoUri))
+                    {
+                        useMongoDB = true;
+                        bool connected = await MongoDBHandler.EstablishConnection();
+                        if (!connected)
+                        {
+                            LogError("Failed to connect to MongoDB - exiting");
+                            return;
+                        }
+                    }
+                    else
+                    {
+                        // Fall back to CosmosDB
+                        await CosmosDB.EstablishConnection();
+                    }
                 }
 
                 // dotnet run db images - will scrape, then upload both data and images
@@ -243,23 +261,25 @@ namespace Scraper
 
                         if (uploadToDatabase && scrapedProduct != null)
                         {
-                            // Try upsert to CosmosDB
-                            UpsertResponse response = await CosmosDB.TransformAndUpsertProduct(scrapedProduct);
+                            // Try upsert to MongoDB or CosmosDB depending on config
+                            UpsertResponse response = useMongoDB
+                                ? await MongoDBHandler.TransformAndUpsertProduct(scrapedProduct)
+                                : await CosmosDB.TransformAndUpsertProduct(scrapedProduct);
 
                             // Increment stats counters based on response from CosmosDB
                             switch (response)
                             {
                                 case UpsertResponse.NewProduct:
-                                    newCount++;
+                                    newCount++; totalNew++;
                                     break;
                                 case UpsertResponse.PriceUpdated:
-                                    priceUpdatedCount++;
+                                    priceUpdatedCount++; totalPriceUpdated++;
                                     break;
                                 case UpsertResponse.NonPriceUpdated:
-                                    nonPriceUpdatedCount++;
+                                    nonPriceUpdatedCount++; totalNonPriceUpdated++;
                                     break;
                                 case UpsertResponse.AlreadyUpToDate:
-                                    upToDateCount++;
+                                    upToDateCount++; totalUpToDate++;
                                     break;
                                 case UpsertResponse.Failed:
                                 default:
@@ -303,7 +323,7 @@ namespace Scraper
                     {
                         // Log consolidated CosmosDB stats for entire page scrape
                         LogWarn(
-                            $"{"CosmosDB:"} {newCount} new products, " +
+                            $"{(useMongoDB ? "MongoDB:" : "CosmosDB:")} {newCount} new products, " +
                             $"{priceUpdatedCount} prices updated, {nonPriceUpdatedCount} info updated, " +
                             $"{upToDateCount} already up-to-date"
                         );
@@ -331,6 +351,19 @@ namespace Scraper
                 {
                     Thread.Sleep(secondsDelayBetweenPageScrapes * 1000);
                 }
+            }
+
+            // Finalise MongoDB scrape run record if used
+            if (useMongoDB)
+            {
+                await MongoDBHandler.FinaliseRun(
+                    totalScraped: totalNew + totalPriceUpdated + totalNonPriceUpdated + totalUpToDate,
+                    newProducts: totalNew,
+                    priceUpdates: totalPriceUpdated,
+                    alreadyUpToDate: totalUpToDate,
+                    failed: 0,
+                    durationSeconds: (int)stopwatch.Elapsed.TotalSeconds
+                );
             }
 
             // Try clean up playwright browser and other resources, then end program
